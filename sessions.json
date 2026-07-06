@@ -1,12 +1,12 @@
 [
   {
     "id": "clientA",
-    "appsScriptUrl": "https://script.google.com/macros/s/PASTE_CLIENT_A_EXEC_URL/exec",
-    "sharedSecret": "generate-a-long-random-string-for-client-a"
+    "appsScriptUrl": "https://script.google.com/macros/s/AKfycbxuS0WKeOQTmR4zkF9P5t6PsIovVD3RftS8jkJNRETqJVWA3vjZfVvcUE6Kj-q7tavUnw/exec",
+    "sharedSecret": "aALKAJDFLlnlv13123kjelf"
   },
   {
     "id": "clientB",
-    "appsScriptUrl": "https://script.google.com/macros/s/PASTE_CLIENT_B_EXEC_URL/exec",
-    "sharedSecret": "generate-a-different-random-string-for-client-b"
+    "appsScriptUrl": "https://script.google.com/macros/s/AKfycbwfLcmtfwPkiRA9anVhpM7FUfZJyzxBm5b3kuoHlv54IUJcv8xlg2kf-kfVMexEezsUZw/exec",
+    "sharedSecret": "aALKAJDFLlnlv13123kjelf"
   }
 ]

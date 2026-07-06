@@ -50,18 +50,17 @@ let connectedNumber = null;
 const client = new Client({
   authStrategy: new LocalAuth(),
   puppeteer: {
-    headless: true,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',   // avoids /dev/shm size limits crashing Chrome
-      '--disable-gpu',
-      '--disable-accelerated-2d-canvas',
-      '--no-first-run',
-      '--no-zygote',
-      '--single-process'           // trades stability for lower memory use
-    ]
-  }
+  headless: true,
+  args: [
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    '--disable-dev-shm-usage',
+    '--disable-gpu',
+    '--disable-accelerated-2d-canvas',
+    '--no-first-run',
+    '--no-zygote'
+  ]
+}
 });
 
 client.on('qr', async (qr) => {

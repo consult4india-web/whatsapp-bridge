@@ -5,7 +5,7 @@
   "main": "whatsapp-server.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "nodemon whatsapp-server.js"
+  "start": "node whatsapp-server.js"
   },
   "keywords": [],
   "author": "",

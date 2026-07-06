@@ -8,7 +8,7 @@
  *
  * SETUP:
  *   npm init -y
- *   npm install whatsapp-web.js qrcode express axios
+ *   npm install whatsapp-web.js qrcode express axios cors dotenv
  *   node whatsapp-server.js
  *
  * This process must stay running (a laptop left on, a VPS, or a "background
@@ -22,6 +22,7 @@
  */
 require('dotenv').config();
 const express = require('express');
+const cors = require('cors');
 const QRCode = require('qrcode');
 const axios = require('axios');
 const { Client, LocalAuth } = require('whatsapp-web.js');
@@ -50,17 +51,17 @@ let connectedNumber = null;
 const client = new Client({
   authStrategy: new LocalAuth(),
   puppeteer: {
-  headless: true,
-  args: [
-    '--no-sandbox',
-    '--disable-setuid-sandbox',
-    '--disable-dev-shm-usage',
-    '--disable-gpu',
-    '--disable-accelerated-2d-canvas',
-    '--no-first-run',
-    '--no-zygote'
-  ]
-}
+    headless: true,
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+      '--disable-accelerated-2d-canvas',
+      '--no-first-run',
+      '--no-zygote'
+    ]
+  }
 });
 
 client.on('qr', async (qr) => {
@@ -149,6 +150,11 @@ client.initialize().catch(err => {
 
 // --- HTTP server: exposes QR + status for the Apps Script frontend to consume ---
 const app = express();
+
+// Allow the Apps Script page (running on script.googleusercontent.com / googleusercontent
+// origins) to fetch() /qr directly from the browser. Without this, the browser blocks
+// the request before it even reaches this server.
+app.use(cors());
 
 app.get('/qr', (req, res) => {
   if (!latestQrPng) return res.status(404).send('QR not ready yet — try again in a few seconds.');

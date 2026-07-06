@@ -1,26 +1,42 @@
 /**
- * whatsapp-server.js
- * -------------------
- * The missing piece Apps Script can't do itself: this connects to WhatsApp Web,
- * exposes the QR code + connection status over HTTP (so the Apps Script frontend
- * can display them), and forwards every incoming message to your Apps Script
- * webhook so it lands in Google Sheets.
+ * whatsapp-server.js (multi-tenant edition)
+ * -------------------------------------------
+ * Hosts MULTIPLE independent WhatsApp sessions from a single running process.
+ * Each session = one WhatsApp number = one Apps Script project (one Sheet).
  *
- * SETUP:
- *   npm init -y
- *   npm install whatsapp-web.js qrcode express axios cors dotenv
- *   node whatsapp-server.js
+ * Instead of one hardcoded APPS_SCRIPT_URL/SHARED_SECRET, sessions are defined
+ * in sessions.json:
+ *   [
+ *     { "id": "clientA", "appsScriptUrl": "...", "sharedSecret": "..." },
+ *     { "id": "clientB", "appsScriptUrl": "...", "sharedSecret": "..." }
+ *   ]
  *
- * This process must stay running (a laptop left on, a VPS, or a "background
- * worker" service like Render/Railway — NOT a serverless function, since it
- * needs a persistent browser session).
+ * Routes are per-session, keyed by the "id" in the path:
+ *   GET /:sessionId/qr       -> QR PNG for that session
+ *   GET /:sessionId/status   -> connection status for that session
  *
- * NOTE: whatsapp-web.js is an unofficial library that automates WhatsApp Web via
- * a headless browser. It is not endorsed by WhatsApp/Meta and carries some risk
- * of the connected number being flagged. Use a number you're comfortable testing
- * with, and consider WhatsApp's official Cloud API for anything production-grade.
+ * In each Apps Script project's Script Properties, set:
+ *   NODE_SERVER_URL = https://<your-ngrok-or-host>/<sessionId>
+ * (Code.gs / QrDialog.html don't need any changes — they already append
+ * "/qr" and "/status" to whatever NODE_SERVER_URL is set to.)
+ *
+ * To add a new client project later: add an entry to sessions.json and
+ * restart the server (or call POST /admin/reload with ADMIN_TOKEN, see below).
+ *
+ * RESILIENCE FEATURES IN THIS VERSION:
+ *  - Auto-reconnect: if a session disconnects, it retries client.initialize()
+ *    automatically after a short delay instead of staying dead.
+ *  - Retrying webhook delivery: if a POST to Apps Script fails (network blip,
+ *    Apps Script temporarily down), it retries a few times with backoff before
+ *    giving up, so a transient failure doesn't silently drop a message.
+ *  - Per-session isolation: an error in one session's Puppeteer/Chrome instance
+ *    is caught and only restarts THAT session, not the whole process.
+ *  - Run this under a process supervisor (PM2 recommended, see setup notes
+ *    below) so the whole Node process restarts automatically if it ever dies.
  */
 require('dotenv').config();
+const fs = require('fs');
+const path = require('path');
 const express = require('express');
 const cors = require('cors');
 const QRCode = require('qrcode');
@@ -35,135 +51,236 @@ process.on('uncaughtException', (err) => {
   console.error('UNCAUGHT EXCEPTION:', err);
 });
 
-// ---- CONFIG: fill these in (or set as environment variables) ----
-const APPS_SCRIPT_URL = process.env.APPS_SCRIPT_URL;
-const SHARED_SECRET = process.env.SHARED_SECRET;
 const PORT = process.env.PORT || 3000;
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || ''; // optional, protects /admin/reload
+const SESSIONS_FILE = path.join(__dirname, 'sessions.json');
+const MAX_MEDIA_BYTES = 15 * 1024 * 1024;
+const RECONNECT_DELAY_MS = 15000;
 
-if (!APPS_SCRIPT_URL || !SHARED_SECRET) {
-  console.error('Missing required env vars: APPS_SCRIPT_URL and/or SHARED_SECRET are not set.');
+// In-memory state, keyed by session id.
+// { client, latestQrPng, isConnected, connectedNumber, appsScriptUrl, sharedSecret }
+const sessions = new Map();
+
+function loadSessionConfigs() {
+  if (!fs.existsSync(SESSIONS_FILE)) {
+    console.error('sessions.json not found at', SESSIONS_FILE);
+    return [];
+  }
+  try {
+    const raw = fs.readFileSync(SESSIONS_FILE, 'utf8');
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) throw new Error('sessions.json must be a JSON array');
+    return parsed;
+  } catch (err) {
+    console.error('Failed to parse sessions.json:', err.message);
+    return [];
+  }
 }
 
-let latestQrPng = null;   // Buffer of the current QR code as a PNG
-let isConnected = false;
-let connectedNumber = null;
-
-const client = new Client({
-  authStrategy: new LocalAuth(),
-  puppeteer: {
-    headless: true,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu',
-      '--disable-accelerated-2d-canvas',
-      '--no-first-run',
-      '--no-zygote'
-    ]
-  }
-});
-
-client.on('qr', async (qr) => {
-  isConnected = false;
-  const dataUrl = await QRCode.toDataURL(qr);
-  latestQrPng = Buffer.from(dataUrl.split(',')[1], 'base64');
-  console.log('New QR code ready — open the Apps Script web app page to scan it.');
-});
-
-client.on('ready', () => {
-  isConnected = true;
-  connectedNumber = client.info.wid.user;
-  console.log('WhatsApp connected as', connectedNumber);
-});
-
-client.on('disconnected', (reason) => {
-  isConnected = false;
-  connectedNumber = null;
-  console.log('WhatsApp disconnected:', reason);
-});
-
-const MAX_MEDIA_BYTES = 15 * 1024 * 1024; // safety cap so huge videos don't blow up the webhook payload
-
-client.on('message', async (msg) => {
-  try {
-    // Skip WhatsApp "Status" broadcast posts — not real chat messages.
-    if (msg.isStatus || msg.from === 'status@broadcast') return;
-
-    const chat = await msg.getChat();
-    const isGroup = chat.isGroup;
-
-    let senderName = '';
+// Retries a POST a few times with backoff before giving up, so a momentary
+// Apps Script/network blip doesn't silently drop an incoming message.
+async function postWithRetry(url, payload, attempts = 3) {
+  for (let i = 1; i <= attempts; i++) {
     try {
-      const contact = await msg.getContact();
-      senderName = contact.pushname || contact.name || contact.number || '';
-    } catch (_) { /* ignore contact lookup failures */ }
-
-    const payload = {
-      secret: SHARED_SECRET,
-      phone: connectedNumber,
-      from: msg.from,
-      chatName: chat.name || senderName || msg.from,
-      chatType: isGroup ? 'group' : 'individual',
-      senderNumber: msg.author || msg.from, // msg.author is the real sender inside a group
-      senderName: senderName,
-      type: msg.type,
-      message: msg.body,
-      id: msg.id.id,
-      timestamp: msg.timestamp
-    };
-
-    if (msg.hasMedia) {
-      try {
-        const media = await msg.downloadMedia();
-        if (media && media.data) {
-          const approxBytes = (media.data.length * 3) / 4; // base64 -> raw byte estimate
-          if (approxBytes <= MAX_MEDIA_BYTES) {
-            payload.media = {
-              mimetype: media.mimetype,
-              data: media.data, // base64 string
-              filename: media.filename || ('wa_' + Date.now())
-            };
-          } else {
-            const mb = Math.round(approxBytes / 1024 / 1024);
-            payload.message = (payload.message ? payload.message + ' ' : '') + `[media skipped: ${mb}MB, over limit]`;
-          }
-        }
-      } catch (mediaErr) {
-        console.error('Failed to download media:', mediaErr.message);
-        payload.message = (payload.message ? payload.message + ' ' : '') + '[media download failed]';
-      }
+      await axios.post(url, payload, { maxBodyLength: Infinity, maxContentLength: Infinity, timeout: 20000 });
+      return true;
+    } catch (err) {
+      console.error(`Webhook POST attempt ${i}/${attempts} failed:`, err.message);
+      if (i < attempts) await new Promise(r => setTimeout(r, 2000 * i)); // 2s, 4s, ...
     }
-
-    await axios.post(APPS_SCRIPT_URL, payload, {
-      maxBodyLength: Infinity,
-      maxContentLength: Infinity
-    });
-  } catch (err) {
-    console.error('Failed to forward message to Apps Script:', err.message);
   }
-});
+  console.error('All webhook POST attempts failed for', url, '- message was NOT delivered.');
+  return false;
+}
 
-client.initialize().catch(err => {
-  console.error('client.initialize() failed:', err);
-});
+function startSession(config) {
+  const { id, appsScriptUrl, sharedSecret } = config;
 
-// --- HTTP server: exposes QR + status for the Apps Script frontend to consume ---
+  if (!id || !appsScriptUrl || !sharedSecret) {
+    console.error('Skipping invalid session config (needs id, appsScriptUrl, sharedSecret):', config);
+    return;
+  }
+
+  console.log(`[${id}] starting session...`);
+
+  const state = {
+    client: null,
+    latestQrPng: null,
+    isConnected: false,
+    connectedNumber: null,
+    appsScriptUrl,
+    sharedSecret
+  };
+  sessions.set(id, state);
+
+  createClient(id, state);
+}
+
+function createClient(id, state) {
+  const client = new Client({
+    authStrategy: new LocalAuth({ clientId: id }), // separate auth folder per session
+    puppeteer: {
+      headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--disable-accelerated-2d-canvas',
+        '--no-first-run',
+        '--no-zygote'
+      ]
+    }
+  });
+
+  client.on('qr', async (qr) => {
+    state.isConnected = false;
+    const dataUrl = await QRCode.toDataURL(qr);
+    state.latestQrPng = Buffer.from(dataUrl.split(',')[1], 'base64');
+    console.log(`[${id}] New QR code ready.`);
+  });
+
+  client.on('ready', () => {
+    state.isConnected = true;
+    state.connectedNumber = client.info.wid.user;
+    console.log(`[${id}] WhatsApp connected as`, state.connectedNumber);
+  });
+
+  client.on('disconnected', (reason) => {
+    state.isConnected = false;
+    state.connectedNumber = null;
+    console.log(`[${id}] WhatsApp disconnected:`, reason, '- will retry in', RECONNECT_DELAY_MS / 1000, 's');
+    scheduleReconnect(id, state);
+  });
+
+  client.on('message', async (msg) => {
+    try {
+      if (msg.isStatus || msg.from === 'status@broadcast') return;
+
+      const chat = await msg.getChat();
+      const isGroup = chat.isGroup;
+
+      let senderName = '';
+      try {
+        const contact = await msg.getContact();
+        senderName = contact.pushname || contact.name || contact.number || '';
+      } catch (_) { /* ignore */ }
+
+      const payload = {
+        secret: state.sharedSecret,
+        phone: state.connectedNumber,
+        from: msg.from,
+        chatName: chat.name || senderName || msg.from,
+        chatType: isGroup ? 'group' : 'individual',
+        senderNumber: msg.author || msg.from,
+        senderName: senderName,
+        type: msg.type,
+        message: msg.body,
+        id: msg.id.id,
+        timestamp: msg.timestamp
+      };
+
+      if (msg.hasMedia) {
+        try {
+          const media = await msg.downloadMedia();
+          if (media && media.data) {
+            const approxBytes = (media.data.length * 3) / 4;
+            if (approxBytes <= MAX_MEDIA_BYTES) {
+              payload.media = {
+                mimetype: media.mimetype,
+                data: media.data,
+                filename: media.filename || ('wa_' + Date.now())
+              };
+            } else {
+              const mb = Math.round(approxBytes / 1024 / 1024);
+              payload.message = (payload.message ? payload.message + ' ' : '') + `[media skipped: ${mb}MB, over limit]`;
+            }
+          }
+        } catch (mediaErr) {
+          console.error(`[${id}] Failed to download media:`, mediaErr.message);
+          payload.message = (payload.message ? payload.message + ' ' : '') + '[media download failed]';
+        }
+      }
+
+      await postWithRetry(state.appsScriptUrl, payload);
+    } catch (err) {
+      console.error(`[${id}] Failed to handle/forward message:`, err.message);
+    }
+  });
+
+  client.initialize().catch(err => {
+    console.error(`[${id}] client.initialize() failed:`, err.message);
+    scheduleReconnect(id, state);
+  });
+
+  state.client = client;
+}
+
+function scheduleReconnect(id, state) {
+  if (state.reconnectScheduled) return; // avoid stacking multiple timers
+  state.reconnectScheduled = true;
+  setTimeout(() => {
+    state.reconnectScheduled = false;
+    console.log(`[${id}] attempting reconnect...`);
+    try {
+      if (state.client) state.client.destroy().catch(() => {});
+    } catch (_) { /* ignore */ }
+    createClient(id, state);
+  }, RECONNECT_DELAY_MS);
+}
+
+function startAllSessions() {
+  const configs = loadSessionConfigs();
+  if (configs.length === 0) {
+    console.error('No valid sessions configured — check sessions.json.');
+  }
+  configs.forEach(startSession);
+}
+
+startAllSessions();
+
+// --- HTTP server ---
 const app = express();
-
-// Allow the Apps Script page (running on script.googleusercontent.com / googleusercontent
-// origins) to fetch() /qr directly from the browser. Without this, the browser blocks
-// the request before it even reaches this server.
 app.use(cors());
+app.use(express.json());
 
-app.get('/qr', (req, res) => {
-  if (!latestQrPng) return res.status(404).send('QR not ready yet — try again in a few seconds.');
+app.get('/:sessionId/qr', (req, res) => {
+  const state = sessions.get(req.params.sessionId);
+  if (!state) return res.status(404).send('Unknown session id: ' + req.params.sessionId);
+  if (!state.latestQrPng) return res.status(404).send('QR not ready yet — try again in a few seconds.');
   res.set('Content-Type', 'image/png');
-  res.send(latestQrPng);
+  res.send(state.latestQrPng);
 });
 
-app.get('/status', (req, res) => {
-  res.json({ connected: isConnected, number: connectedNumber });
+app.get('/:sessionId/status', (req, res) => {
+  const state = sessions.get(req.params.sessionId);
+  if (!state) return res.status(404).json({ connected: false, error: 'Unknown session id: ' + req.params.sessionId });
+  res.json({ connected: state.isConnected, number: state.connectedNumber });
 });
 
-app.listen(PORT, () => console.log('Bridge server listening on port', PORT));
+// Optional: lists configured sessions (ids only, no secrets) for a quick sanity check.
+app.get('/admin/sessions', (req, res) => {
+  const list = Array.from(sessions.entries()).map(([id, s]) => ({
+    id, connected: s.isConnected, number: s.connectedNumber
+  }));
+  res.json(list);
+});
+
+// Optional: reload sessions.json without restarting the whole process — starts
+// any newly-added sessions. Protect with ADMIN_TOKEN if you set one in .env.
+app.post('/admin/reload', (req, res) => {
+  if (ADMIN_TOKEN && req.headers['x-admin-token'] !== ADMIN_TOKEN) {
+    return res.status(403).json({ ok: false, error: 'invalid admin token' });
+  }
+  const configs = loadSessionConfigs();
+  let added = 0;
+  configs.forEach(cfg => {
+    if (!sessions.has(cfg.id)) {
+      startSession(cfg);
+      added++;
+    }
+  });
+  res.json({ ok: true, added, total: sessions.size });
+});
+
+app.listen(PORT, () => console.log('Multi-tenant bridge server listening on port', PORT));

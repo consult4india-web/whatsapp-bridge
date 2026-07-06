@@ -1,0 +1,12 @@
+[
+  {
+    "id": "clientA",
+    "appsScriptUrl": "https://script.google.com/macros/s/PASTE_CLIENT_A_EXEC_URL/exec",
+    "sharedSecret": "generate-a-long-random-string-for-client-a"
+  },
+  {
+    "id": "clientB",
+    "appsScriptUrl": "https://script.google.com/macros/s/PASTE_CLIENT_B_EXEC_URL/exec",
+    "sharedSecret": "generate-a-different-random-string-for-client-b"
+  }
+]

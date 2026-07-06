@@ -20,7 +20,7 @@
  * of the connected number being flagged. Use a number you're comfortable testing
  * with, and consider WhatsApp's official Cloud API for anything production-grade.
  */
-
+require('dotenv').config();
 const express = require('express');
 const QRCode = require('qrcode');
 const axios = require('axios');

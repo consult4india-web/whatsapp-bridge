@@ -5,7 +5,7 @@
   "main": "whatsapp-server.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-  "start": "node whatsapp-server.js"
+    "start": "node whatsapp-server.js"
   },
   "keywords": [],
   "author": "",
@@ -13,6 +13,7 @@
   "type": "commonjs",
   "dependencies": {
     "axios": "^1.18.1",
+    "dotenv": "^17.4.2",
     "express": "^5.2.1",
     "nodemon": "^3.1.14",
     "qrcode": "^1.5.4",

@@ -26,18 +26,42 @@ const QRCode = require('qrcode');
 const axios = require('axios');
 const { Client, LocalAuth } = require('whatsapp-web.js');
 
-// ---- CONFIG: fill these in ----
+// ---- Catch crashes that would otherwise exit silently ----
+process.on('unhandledRejection', (err) => {
+  console.error('UNHANDLED REJECTION:', err);
+});
+process.on('uncaughtException', (err) => {
+  console.error('UNCAUGHT EXCEPTION:', err);
+});
+
+// ---- CONFIG: fill these in (or set as environment variables) ----
 const APPS_SCRIPT_URL = process.env.APPS_SCRIPT_URL;
 const SHARED_SECRET = process.env.SHARED_SECRET;
 const PORT = process.env.PORT || 3000;
+
+if (!APPS_SCRIPT_URL || !SHARED_SECRET) {
+  console.error('Missing required env vars: APPS_SCRIPT_URL and/or SHARED_SECRET are not set.');
+}
 
 let latestQrPng = null;   // Buffer of the current QR code as a PNG
 let isConnected = false;
 let connectedNumber = null;
 
 const client = new Client({
-authStrategy: new LocalAuth(),
-  puppeteer: { headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] }
+  authStrategy: new LocalAuth(),
+  puppeteer: {
+    headless: true,
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',   // avoids /dev/shm size limits crashing Chrome
+      '--disable-gpu',
+      '--disable-accelerated-2d-canvas',
+      '--no-first-run',
+      '--no-zygote',
+      '--single-process'           // trades stability for lower memory use
+    ]
+  }
 });
 
 client.on('qr', async (qr) => {
@@ -120,7 +144,9 @@ client.on('message', async (msg) => {
   }
 });
 
-client.initialize();
+client.initialize().catch(err => {
+  console.error('client.initialize() failed:', err);
+});
 
 // --- HTTP server: exposes QR + status for the Apps Script frontend to consume ---
 const app = express();
